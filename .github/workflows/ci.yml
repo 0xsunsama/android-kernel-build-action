@@ -12,10 +12,8 @@ jobs:
       matrix:
         tag:
           - android12-5.10
-          - android13-5.10
         arch:
           - aarch64
-          - x86_64
 
     steps:
       - name: Maximize build space
