@@ -1,108 +1,124 @@
-#include <asm/fcntl.h>
-#include <asm/pgtable.h>
-#include <asm/processor.h>
-#include <asm/uaccess.h>
-#include <linux/dcache.h>
-#include <linux/err.h>
-#include <linux/errno.h>
-#include <linux/fs.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/mm.h>
+// full_phys_dump.c
 #include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/sched.h>
-#include <linux/string.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/proc_fs.h>
+#include <linux/ioport.h>
+#include <linux/uaccess.h>
+#include <linux/version.h>
 
-static ulong start = 0;
-static int pid = 0;
-static ulong end = 0;
+#define DUMP_FILE "/data/local/tmp/full_phys_dump.bin"
+#define PROC_ENTRY "full_phys_dump"
 
-module_param(start, ulong, S_IRUGO);
-module_param(end, ulong, S_IRUGO);
-module_param(pid, int, S_IRUGO);
+static struct proc_dir_entry *proc_entry;
+static struct file *dump_file;
+static loff_t file_pos;
 
-static int __init main_init(void) {
-  ulong data_len = end - start;
-  struct task_struct *task;
-  char *vaddr;
-  int retval = 0;
-  int ret;
-  //   int i = 0;
-  pgd_t *pgd = NULL;
-  pud_t *pud = NULL;
-  pmd_t *pmd = NULL;
-  pte_t *pte = NULL;
-  struct file *fp;
-  mm_segment_t old_fs;
-  loff_t pos;
-  struct page *page;
+static int dump_physical_memory(void)
+{
+    struct resource *res;
+    unsigned long long start, end;
+    void __iomem *vaddr;
+    char *buffer;
+    int ret = 0;
+    const size_t chunk_size = 2*1024*1024; // 2MB chunks
 
-  if (start == 0 || pid == 0) {
-    printk("insmod main <start=?> <end=?> <pid=?>\n");
-    return 0;
-  }
+    // 获取所有系统物理内存区域
+    for (res = iomem_resource.child; res; res = res->sibling) {
+        if (strcmp(res->name, "System RAM") != 0)
+            continue;
 
-  printk("start:0x%lX, data_len:%ld, pid:%d\n", start, end, pid);
+        start = res->start;
+        end = res->end;
 
-  for_each_process(task) {
-    if (task->pid == pid) {
-      printk("find task:%s\n", task->comm);
-      retval = 1;
-      break;
+        printk(KERN_INFO "Dumping physical range: %llx-%llx\n", start, end);
+
+        buffer = vmalloc(chunk_size);
+        if (!buffer) {
+            ret = -ENOMEM;
+            break;
+        }
+
+        while (start <= end) {
+            unsigned long size = min_t(unsigned long, chunk_size, end - start + 1);
+            
+            // 映射物理内存
+            vaddr = memremap(start, size, MEMREMAP_WB);
+            if (!vaddr) {
+                printk(KERN_WARNING "Failed to map %llx-%llx\n", start, start+size-1);
+                start += size;
+                continue;
+            }
+
+            // 复制内存内容
+            memcpy(buffer, vaddr, size);
+            memunmap(vaddr);
+
+            // 写入文件
+            if (kernel_write(dump_file, buffer, size, &file_pos) != size) {
+                printk(KERN_ERR "Write failed at %llx\n", start);
+                ret = -EIO;
+                break;
+            }
+
+            start += size;
+        }
+
+        vfree(buffer);
+        if (ret)
+            break;
     }
-  }
 
-  if (retval == 0) {
-    printk("not find task\n");
-    return -1;
-  }
-
-  pgd = pgd_offset(task->mm, start);
-  if (pgd_none(*pgd)) {
-    printk("not mapped in pgd\n");
-    return -1;
-  }
-
-  pud = pud_offset((pgd_t *)pgd, start);
-  if (pud_none(*pud)) {
-    printk("not mapped in pud\n");
-    return -1;
-  }
-
-  pmd = pmd_offset(pud, start);
-  if (pmd_none(*pmd)) {
-    printk("not mapped in pmd\n");
-    return -1;
-  }
-
-  pte = pte_offset_kernel(pmd, start);
-  if (pte_none(*pte)) {
-    printk("not mapped in pte\n");
-    return -1;
-  }
-  page = pte_page(*pte);
-  vaddr = page_address(page);
-
-  //  kernel dump
-  fp = filp_open("/data/local/tmp/dump.kernel", O_RDWR | O_CREAT, 0644);
-  if (IS_ERR(fp)) {
-    ret = PTR_ERR(fp);
-    printk(KERN_INFO "/data/local/tmp/dump.kernel = %d\n", ret);
     return ret;
-  }
-  old_fs = get_fs();
-  set_fs(KERNEL_DS);
-  pos = fp->f_pos;
-  vfs_write(fp, vaddr, data_len, &pos);
-  fp->f_pos = pos;
-  set_fs(old_fs);
-  filp_close(fp, NULL);
-  return 0;
 }
 
-static void __exit main_exit(void) {}
+static ssize_t proc_write(struct file *file, const char __user *buf,
+                        size_t count, loff_t *ppos)
+{
+    int ret;
 
-module_init(main_init);
-module_exit(main_exit);
+    // 打开输出文件
+    dump_file = filp_open(DUMP_FILE, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+    if (IS_ERR(dump_file)) {
+        ret = PTR_ERR(dump_file);
+        printk(KERN_ERR "Open file failed: %d\n", ret);
+        return ret;
+    }
+
+    file_pos = 0;
+
+    ret = dump_physical_memory();
+    filp_close(dump_file, NULL);
+
+    return ret ? ret : count;
+}
+
+static const struct proc_ops fops = {
+    .proc_write = proc_write,
+};
+
+static int __init phys_dump_init(void)
+{
+    proc_entry = proc_create(PROC_ENTRY, 0222, NULL, &fops);
+    if (!proc_entry)
+        return -ENOMEM;
+
+    printk(KERN_INFO "Physical memory dumper loaded\n");
+    return 0;
+}
+
+static void __exit phys_dump_exit(void)
+{
+    if (proc_entry)
+        proc_remove(proc_entry);
+
+    printk(KERN_INFO "Physical memory dumper unloaded\n");
+}
+
+module_init(phys_dump_init);
+module_exit(phys_dump_exit);
+
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("Full Physical Memory Dumper");
