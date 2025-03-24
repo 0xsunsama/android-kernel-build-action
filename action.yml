@@ -8,7 +8,7 @@ branding:
 inputs:
   tag:
     description: 'Specify the Android kernel version and tag to build for (e.g., android13-5.15).'
-    default: 'android13-5.15'
+    default: 'android12-5.10'
     required: true
   arch:
     description: 'Specify the architecture to build for (e.g., aarch64 or x86_64).'
@@ -33,7 +33,7 @@ runs:
     - name: Validate Input
       shell: bash
       run: |
-        VALID_TAGS=("android12-5.10" "android13-5.10" "android13-5.15" "android14-5.15" "android14-6.1" "android15-6.6" "android16-6.12")
+        VALID_TAGS=("android12-5.10" "android13-5.10")
         if [[ ! " ${VALID_TAGS[@]} " =~ " ${{ inputs.tag }} " ]]; then
           echo "Invalid tag specified: ${{ inputs.tag }}. Must be one of: ${VALID_TAGS[@]}"
           exit 1
